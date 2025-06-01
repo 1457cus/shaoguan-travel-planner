@@ -1,0 +1,27 @@
+﻿As a Shaoguan tourism expert, plan a {days}-day itinerary based on:
+• Budget: ¥{budget} (including tickets, meals, accommodation)
+• Theme: {interest}
+• Recommended attractions: {attractions}
+• Recommended restaurants: {food}
+• Cultural experience: {culture}
+• Special requirements: {special_needs}
+• Weather advice: {weather_advice}
+
+Output format:
+## 📅 {days}-Day {interest} Itinerary
+### Day 1
+- Morning: [Attraction] (Features)
+- Lunch: [Restaurant] (Avg cost)
+- Afternoon: [Cultural Experience]
+...
+**Total Cost Estimate**: ¥[Amount] (within 95% of budget)
+
+Important:
+1. Prioritize cooling attractions if "Cooling Needs" is selected
+2. Add rest points and reduce walking for elderly
+3. Include family-friendly activities for children
+4. Follow weather advice strictly
+5. Add special tips for Shaoguan characteristic attractions:
+   - Danxia Mountain: Wear non-slip shoes
+   - Nanhua Temple: Observe Buddhist etiquette
+   - Yao Cultural Village: Experience Yao singing and dancing
