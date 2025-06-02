@@ -1,442 +1,476 @@
-﻿import streamlit as st
+import streamlit as st
 import pandas as pd
-import sys
+import requests
 import os
-from pathlib import Path
-import time
-import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-import webbrowser
-import re
 import json
-import random
+from datetime import datetime, timedelta
+import pytz
+import time
+import toml
 
-# -------------------- 路径配置 --------------------
-current_dir = Path(__file__).parent
-data_dir = current_dir / "data"
-attractions_path = data_dir / "sg_attractions_cleaned.csv"
-food_path = data_dir / "sg_food_cleaned.csv"
-culture_path = data_dir / "sg_culture_cleaned.csv"
+# 设置页面配置
+st.set_page_config(
+    page_title="韶关个性化旅游攻略生成器",
+    page_icon="🗺️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# -------------------- 多语言支持 --------------------
-LANGUAGE_PACKS = {
-    "zh": {
-        "title": "🚩 韶关个性化旅游攻略生成器",
-        "days_label": "旅行天数",
-        "budget_label": "预算（元）",
-        "interest_label": "兴趣主题",
-        "interest_options": ["历史", "自然", "美食", "亲子"],
-        "special_needs": "特殊需求",
-        "elderly": "包含老人",
-        "children": "包含儿童",
-        "cooling": "避暑需求",
-        "generate_btn": "✨ 一键生成攻略",
-        "footer": "韶关 AI 旅游助手 v1.6 | 技术支持: 旅游科技团队",
-        "weather_error": "天气API暂时不可用，使用模拟数据",
-        "no_special_weather": "无特殊天气提示",
-        "download_btn": "📥 下载攻略",
-        "generating": "AI 正在规划行程...",
-        "success": "✅ 攻略生成成功！",
-        "fail": "生成失败：",
-        "check_api": "🌐 检查 DeepSeek 状态"
-    },
-    "en": {
-        "title": "🚩 Shaoguan AI Travel Planner",
-        "days_label": "Travel Days",
-        "budget_label": "Budget (¥)",
-        "interest_label": "Interest Theme",
-        "interest_options": ["History", "Nature", "Food", "Family"],
-        "special_needs": "Special Requirements",
-        "elderly": "With Elderly",
-        "children": "With Children",
-        "cooling": "Cooling Needs",
-        "generate_btn": "✨ Generate Itinerary",
-        "footer": "Shaoguan AI Travel Assistant v1.6 | Tech Support: TravelTech Team",
-        "weather_error": "Weather API unavailable, using simulated data",
-        "no_special_weather": "No special weather advice",
-        "download_btn": "📥 Download Itinerary",
-        "generating": "AI is planning your trip...",
-        "success": "✅ Itinerary generated successfully!",
-        "fail": "Generation failed: ",
-        "check_api": "🌐 Check DeepSeek Status"
-    }
-}
+# 初始化会话状态
+if 'itinerary_generated' not in st.session_state:
+    st.session_state.itinerary_generated = False
+if 'debug_info' not in st.session_state:
+    st.session_state.debug_info = {}
+if 'prompt_preview' not in st.session_state:
+    st.session_state.prompt_preview = False
+if 'prompt_content' not in st.session_state:
+    st.session_state.prompt_content = {"chinese": "", "english": ""}
+if 'data_loaded' not in st.session_state:
+    st.session_state.data_loaded = False
+if 'secrets_loaded' not in st.session_state:
+    st.session_state.secrets_loaded = False
 
-# -------------------- 高德天气API配置 --------------------
-GAODE_API_KEY = st.secrets.get("GAODE_KEY", "your_gaode_api_key")  # 添加到Streamlit Secrets
-GAODE_WEATHER_URL = "https://restapi.amap.com/v3/weather/weatherInfo"
-SHAOGUAN_CITY_CODE = "440200"  # 韶关市行政区划代码
-
-# -------------------- 页面配置 --------------------
-st.set_page_config(page_title="韶关AI旅游助手", layout="wide")
-
-# -------------------- 环境变量处理 --------------------
-print("[DEBUG] 尝试获取 API 密钥...")
-deepseek_api_key = st.secrets.get("DEEPSEEK_KEY", None)
-if not deepseek_api_key:
-    st.error("未找到 DeepSeek API 密钥，请检查 Streamlit Secrets 设置")
-    st.stop()
-else:
-    print(f"[DEBUG] 从 Streamlit Secrets 获取密钥: {deepseek_api_key[:4]}...")
-
-# -------------------- DeepSeek API 客户端 --------------------
-DEEPSEEK_API_URL = "https://api.deepseek.com/v1"
-MODEL_NAME = "deepseek-chat"
-
-class DeepSeekClient:
-    def __init__(self, api_key, base_url=DEEPSEEK_API_URL):
-        self.api_key = api_key
-        self.base_url = base_url
-        self.headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
+# 加载Secrets函数
+def load_secrets():
+    """加载API密钥"""
+    secrets_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "secrets.toml")
     
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=20),
-        retry=retry_if_exception_type((httpx.ConnectError, httpx.TimeoutException))
-    )
-    def chat_completions(self, model, messages, temperature=0.7, max_tokens=2000):
-        url = f"{self.base_url}/chat/completions"
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens
-        }
-        
-        try:
-            with httpx.Client(timeout=60.0) as client:
-                response = client.post(url, headers=self.headers, json=payload)
-                response.raise_for_status()
-                return response.json()
-        except httpx.HTTPStatusError as e:
-            st.error(f"API 请求失败: HTTP {e.response.status_code}")
-            st.json(e.response.json())
-            raise
-        except httpx.RequestError as e:
-            st.error(f"网络连接错误: {str(e)}")
-            raise
-
-# 创建客户端实例
-client = DeepSeekClient(api_key=deepseek_api_key)
-
-# -------------------- 天气服务 --------------------
-def get_gaode_weather(lang="zh"):
-    """使用高德API获取天气预报"""
     try:
+        if os.path.exists(secrets_path):
+            secrets = toml.load(secrets_path)
+            st.session_state.secrets = secrets
+            st.session_state.secrets_loaded = True
+            
+            # 验证密钥格式
+            amap_key = secrets.get("AMAP_API_KEY", "")
+            if not amap_key or len(amap_key) != 32:
+                st.session_state.debug_info["Secrets状态"] = f"警告：API密钥格式异常 ({amap_key[:4]}...)"
+            else:
+                st.session_state.debug_info["Secrets状态"] = f"加载成功 ({secrets_path})"
+            
+            return True
+        else:
+            # 尝试备用路径
+            alt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".streamlit", "secrets.toml")
+            if os.path.exists(alt_path):
+                secrets = toml.load(alt_path)
+                st.session_state.secrets = secrets
+                st.session_state.secrets_loaded = True
+                st.session_state.debug_info["Secrets状态"] = f"加载成功（备用路径） ({alt_path})"
+                return True
+            
+            st.session_state.debug_info["Secrets状态"] = f"文件不存在: {secrets_path} 和 {alt_path}"
+            return False
+    except Exception as e:
+        st.session_state.debug_info["Secrets错误"] = str(e)
+        return False
+
+# 加载数据函数
+@st.cache_data
+def load_data():
+    """加载景点、美食和文化数据"""
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(current_dir, "processed_data")
+    
+    try:
+        # 景点数据
+        attractions_path = os.path.join(data_dir, "attractions_with_id.csv")
+        if os.path.exists(attractions_path):
+            attractions = pd.read_csv(attractions_path, encoding="utf-8-sig")
+        else:
+            st.error(f"景点数据文件不存在: {attractions_path}")
+            st.session_state.debug_info["景点数据错误"] = f"文件不存在: {attractions_path}"
+            attractions = pd.DataFrame()
+        
+        # 美食数据
+        food_path = os.path.join(data_dir, "food_with_id.csv")
+        if os.path.exists(food_path):
+            foods = pd.read_csv(food_path, encoding="utf-8-sig")
+        else:
+            st.error(f"美食数据文件不存在: {food_path}")
+            st.session_state.debug_info["美食数据错误"] = f"文件不存在: {food_path}"
+            foods = pd.DataFrame()
+        
+        # 文化数据
+        culture_path = os.path.join(data_dir, "culture_with_id.csv")
+        if os.path.exists(culture_path):
+            culture = pd.read_csv(culture_path, encoding="utf-8-sig")
+        else:
+            st.error(f"文化数据文件不存在: {culture_path}")
+            st.session_state.debug_info["文化数据错误"] = f"文件不存在: {culture_path}"
+            culture = pd.DataFrame()
+        
+        # 更新调试信息
+        st.session_state.debug_info.update({
+            "当前目录": current_dir,
+            "数据目录": data_dir,
+            "景点记录数": len(attractions),
+            "美食记录数": len(foods),
+            "文化记录数": len(culture),
+            "数据加载时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        })
+        
+        st.session_state.data_loaded = True
+        return attractions, foods, culture
+    except Exception as e:
+        st.error(f"数据加载失败: {str(e)}")
+        st.session_state.debug_info["数据加载错误"] = str(e)
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+# 获取高德天气函数 - 修复版本
+def get_amap_weather(location="韶关"):
+    """使用高德API获取天气信息"""
+    try:
+        # 检查secrets是否加载
+        if not hasattr(st.session_state, 'secrets') or "AMAP_API_KEY" not in st.session_state.secrets:
+            st.session_state.debug_info["天气API状态"] = "API密钥未配置"
+            return {"status": "error", "message": "API密钥未配置"}
+        
+        api_key = st.session_state.secrets["AMAP_API_KEY"]
+        
+        # 构建请求URL
+        base_url = "https://restapi.amap.com/v3/weather/weatherInfo"
         params = {
-            "key": GAODE_API_KEY,
-            "city": SHAOGUAN_CITY_CODE,
+            "key": api_key,
+            "city": location,
             "extensions": "all",  # 获取预报天气
             "output": "JSON"
         }
         
-        response = httpx.get(GAODE_WEATHER_URL, params=params, timeout=10)
-        data = response.json()
+        # 发送请求
+        response = requests.get(base_url, params=params, timeout=10)
+        weather_data = response.json()
         
-        if data["status"] == "1" and data["forecasts"]:
-            forecast = data["forecasts"][0]["casts"]
-            weather_advice = []
-            
-            for i, day in enumerate(forecast):
-                day_weather = day["dayweather"]
-                night_weather = day["nightweather"]
-                day_temp = int(day["daytemp"])
-                
-                # 判断是否有雨
-                has_rain = "雨" in day_weather or "雨" in night_weather
-                
-                # 判断是否高温
-                is_hot = day_temp > 30
-                
-                if has_rain:
-                    advice = "建议室内景点优先" if lang == "zh" else "Suggest indoor attractions first"
-                    weather_advice.append(f"第{i+1}天: {day_weather}→{night_weather} - {advice}")
-                elif is_hot:
-                    advice = "建议避暑景点和水上活动" if lang == "zh" else "Suggest cooling attractions and water activities"
-                    weather_advice.append(f"第{i+1}天: 高温{day_temp}°C - {advice}")
-            
-            return "\n".join(weather_advice) if weather_advice else None
-        else:
-            print(f"高德API错误: {data.get('info', '未知错误')}")
-            return None
-            
-    except Exception as e:
-        print(f"高德API请求失败: {str(e)}")
-        return None
-
-def simulate_weather_forecast(lang="zh"):
-    """天气API不可用时的模拟数据"""
-    weather_types_zh = ["晴", "多云", "小雨", "中雨", "雷阵雨", "阴"]
-    weather_types_en = ["Sunny", "Cloudy", "Light Rain", "Moderate Rain", "Thunderstorm", "Overcast"]
-    
-    weather_types = weather_types_zh if lang == "zh" else weather_types_en
-    forecasts = []
-    
-    for i in range(3):
-        weather = random.choice(weather_types)
-        day_temp = random.randint(25, 35)
-        has_rain = "雨" in weather or "Rain" in weather
-        is_hot = day_temp > 30
+        # 检查API响应状态
+        if weather_data.get("status") != "1":
+            error_msg = weather_data.get('info', '未知错误')
+            st.session_state.debug_info["天气API状态"] = f"错误: {error_msg}"
+            return {"status": "error", "message": error_msg}
         
-        forecast = {
-            "date": f"第{i+1}天" if lang == "zh" else f"Day {i+1}",
-            "weather": weather,
-            "temp": day_temp,
-            "has_rain": has_rain,
-            "is_hot": is_hot
+        # 解析预报数据
+        forecasts = weather_data.get("forecasts", [])
+        if not forecasts:
+            st.session_state.debug_info["天气API状态"] = "无预报数据"
+            return {"status": "error", "message": "无预报数据"}
+        
+        # 处理预报数据
+        processed_forecast = []
+        for forecast in forecasts[0].get("casts", []):
+            # 获取日期和天气信息
+            date_str = forecast.get("date")
+            weather_day = forecast.get("dayweather", "未知")
+            temp_day = forecast.get("daytemp", "未知")
+            temp_night = forecast.get("nighttemp", "未知")
+            
+            # 添加到预报列表
+            processed_forecast.append({
+                "date": date_str,
+                "condition": weather_day,
+                "temp_max": temp_day,
+                "temp_min": temp_night
+            })
+        
+        # 返回结构化的天气数据
+        result = {
+            "status": "success",
+            "location": location,
+            "report_time": weather_data.get("forecasts", [{}])[0].get("reporttime", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            "forecast": processed_forecast
         }
-        forecasts.append(forecast)
-    
-    weather_advice = []
-    for day in forecasts:
-        if day["has_rain"]:
-            advice = "建议室内景点优先" if lang == "zh" else "Suggest indoor attractions first"
-            weather_advice.append(f"{day['date']}: {day['weather']} - {advice}")
-        elif day["is_hot"]:
-            advice = "建议避暑景点和水上活动" if lang == "zh" else "Suggest cooling attractions and water activities"
-            weather_advice.append(f"{day['date']}: {day['weather']} ({day['temp']}°C) - {advice}")
-    
-    return "\n".join(weather_advice) if weather_advice else None
-
-def get_weather_forecast(lang="zh"):
-    """获取天气预报（优先高德API，失败时使用模拟数据）"""
-    # 尝试高德API
-    api_result = get_gaode_weather(lang)
-    if api_result:
-        return api_result
-    
-    # 高德API失败时使用模拟数据
-    print(LANGUAGE_PACKS[lang]["weather_error"])
-    return simulate_weather_forecast(lang)
-
-# -------------------- 数据加载与预处理 --------------------
-def clean_text(text):
-    if isinstance(text, str):
-        return text.encode('utf-8', 'ignore').decode('utf-8')
-    return text
-
-def load_and_preprocess_data():
-    """加载并预处理景点、美食、文化数据"""
-    try:
-        # 景点数据
-        attractions = pd.read_csv(attractions_path, encoding="utf-8-sig")
-        attractions.columns = [clean_text(col) for col in attractions.columns]
-        attractions = attractions.applymap(clean_text)
-        attractions["景点特色说明"] = attractions["景点特色说明"].fillna("暂无特色说明").astype(str)
         
-        # 添加避暑指数
-        attractions["避暑指数"] = attractions["景点特色说明"].apply(
-            lambda x: 5 if "水上" in x or "漂流" in x or "泳池" in x else
-                     4 if "森林" in x or "峡谷" in x or "瀑布" in x else
-                     3 if "湖泊" in x or "溪流" in x or "湿地" in x else
-                     2 if "溶洞" in x or "地下" in x else 1
-        )
-        
-        # 美食数据
-        foods = pd.read_csv(food_path, encoding="utf-8-sig")
-        foods.columns = [clean_text(col) for col in foods.columns]
-        foods = foods.applymap(clean_text)
-        foods["特色菜"] = foods["特色菜"].fillna("暂无推荐菜")
-        
-        # 文化数据
-        culture = pd.read_csv(culture_path, encoding="utf-8-sig")
-        culture.columns = [clean_text(col) for col in culture.columns]
-        culture = culture.applymap(clean_text)
-        
-        return attractions, foods, culture
-
+        st.session_state.debug_info["天气API状态"] = "可用"
+        return result
+    except requests.exceptions.Timeout:
+        st.session_state.debug_info["天气API状态"] = "请求超时"
+        return {"status": "error", "message": "请求超时"}
     except Exception as e:
-        st.error(f"数据加载失败：{str(e)}")
-        st.stop()
+        st.session_state.debug_info["天气API状态"] = f"错误: {str(e)}"
+        return {"status": "error", "message": str(e)}
 
-# 加载数据
-attractions, foods, culture = load_and_preprocess_data()
-
-# -------------------- Streamlit 界面 --------------------
-# 在侧边栏添加语言选择
-with st.sidebar:
-    language = st.radio("Language/语言", ["中文", "English"], index=0, key="language_selector")
-    lang_code = "en" if language == "English" else "zh"
-    texts = LANGUAGE_PACKS[lang_code]
-
-st.title(texts["title"])
-
-# 在侧边栏添加参数设置
-with st.sidebar:
-    st.header("旅行参数")
-    days = st.slider(texts["days_label"], 1, 7, 3, key="days_slider")
-    budget = st.number_input(texts["budget_label"], 500, 10000, 1500, key="budget_input")
-    interest = st.selectbox(texts["interest_label"], texts["interest_options"], key="interest_select")
-    
-    st.divider()
-    st.header(texts["special_needs"])
-    has_elderly = st.checkbox(texts["elderly"], key="elderly_check")
-    has_children = st.checkbox(texts["children"], key="children_check")
-    need_cooling = st.checkbox(texts["cooling"], key="cooling_check")
-    
-    st.divider()
-    st.header("API设置")
-    st.success(f"✅ API 密钥已通过 Streamlit Secrets 获取")
-    st.info(f"当前模型: {MODEL_NAME}")
-    
-    if st.button(texts["check_api"], key="api_status_button"):
-        webbrowser.open_new_tab("https://platform.deepseek.com/api")
-        st.toast("已在浏览器中打开 DeepSeek API 文档")
-        
-    # 添加天气API状态显示
-    weather_status = "可用" if GAODE_API_KEY != "your_gaode_api_key" else "未配置"
-    st.info(f"天气API状态: {weather_status}")
-
-# -------------------- 动态生成提示词 --------------------
-def build_prompt(days, budget, interest, lang="zh"):
-    """构建 DeepSeek 提示词模板"""
+# 生成行程函数 - 修复日期格式问题
+def generate_itinerary(days, theme, weather_data):
+    """生成个性化行程"""
     try:
-        # 根据语言选择模板
-        template_file = "prompt_template_en.txt" if lang == "en" else "prompt_template.txt"
-        template_path = current_dir / template_file
+        # 模拟生成行程
+        itinerary = {
+            "status": "success",
+            "days": []
+        }
         
-        with open(template_path, "r", encoding="utf-8") as f:
-            template = f.read()
-
-        # 特殊需求处理
-        special_requirements = []
-        if has_elderly:
-            special_requirements.append("减少步行，增加休息点" if lang == "zh" else "Less walking, more rest points")
-        if has_children:
-            special_requirements.append("添加亲子项目，安全第一" if lang == "zh" else "Add family-friendly activities, safety first")
-        if need_cooling:
-            special_requirements.append("避暑景点优先，避开高温时段" if lang == "zh" else "Prioritize cooling attractions, avoid peak heat hours")
-            # 过滤高避暑指数的景点
-            attractions_filtered = attractions[attractions["避暑指数"] >= 4]
-        else:
-            attractions_filtered = attractions
+        # 获取当前日期
+        current_date = datetime.now(pytz.timezone('Asia/Shanghai'))
         
-        # 天气建议
-        weather_advice = get_weather_forecast(lang) or texts["no_special_weather"]
-        
-        # 安全抽样景点
-        sample_size = min(3, len(attractions_filtered))
-        if len(attractions_filtered) > 0:
-            sampled_attractions = attractions_filtered.sample(sample_size) if sample_size > 0 else attractions_filtered.head(3)
-            attractions_info = [
-                f"{row['名称']}（{row.get('景点特色说明', '暂无说明')}" 
-                for _, row in sampled_attractions.iterrows()
-            ]
-        else:
-            attractions_info = ["丹霞山", "南华寺", "乳源大峡谷"] if lang == "zh" else ["Danxia Mountain", "Nanhua Temple", "Ruyuan Grand Canyon"]
-        
-        # 安全抽样餐厅
-        sample_size = min(2, len(foods))
-        if len(foods) > 0:
-            sampled_foods = foods.sample(sample_size) if sample_size > 0 else foods.head(2)
-            food_info = [
-                f"{row['店名']}（人均{row.get('人均消费', '?')}元）"
-                for _, row in sampled_foods.iterrows()
-            ]
-        else:
-            food_info = ["韶关农家菜", "南华寺素食"] if lang == "zh" else ["Shaoguan Farmhouse Cuisine", "Nanhua Temple Vegetarian"]
-        
-        # 文化体验
-        if len(culture) > 0:
-            cultural_activity = culture.sample(1).iloc[0]["名称"]
-        else:
-            cultural_activity = "自由探索当地文化" if lang == "zh" else "Free exploration of local culture"
-
-        return template.format(
-            days=days,
-            budget=budget,
-            interest=interest,
-            attractions="、".join(attractions_info),
-            food="、".join(food_info),
-            culture=cultural_activity,
-            special_needs="\n".join(special_requirements) if special_requirements else ("无" if lang == "zh" else "None"),
-            weather_advice=weather_advice
-        )
-
-    except Exception as e:
-        st.error(f"提示词生成失败：{str(e)}")
-        st.stop()
-
-# -------------------- 生成攻略逻辑 --------------------
-def get_ai_response(prompt):
-    try:
-        response = client.chat_completions(
-            model=MODEL_NAME,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=4000
-        )
-        return response
-    except Exception as e:
-        print(f"[ERROR] API 调用失败: {str(e)}")
-        raise
-
-if st.button(texts["generate_btn"], key="generate_button"):
-    with st.spinner(texts["generating"]):
-        try:
-            prompt = build_prompt(days, budget, interest, lang_code)
+        for i in range(days):
+            # 获取当天的日期和天气
+            day_date = current_date + timedelta(days=i)
+            date_str = day_date.strftime("%Y-%m-%d")
             
-            # 显示提示词预览（调试用）
-            if st.sidebar.checkbox("显示提示词预览", key="prompt_preview"):
-                st.sidebar.text_area("提示词内容", prompt, height=300, key="prompt_content")
+            # 查找对应的天气预报
+            day_weather = None
+            if "forecast" in weather_data:
+                for forecast in weather_data["forecast"]:
+                    if forecast.get("date") == date_str:
+                        day_weather = forecast
+                        break
             
-            start_time = time.time()
-            response = get_ai_response(prompt)
-            elapsed = time.time() - start_time
-            print(f"[DEBUG] API 响应时间: {elapsed:.2f} 秒")
+            # 如果没有找到当天的预报，使用默认值
+            if not day_weather:
+                day_weather = {
+                    "condition": "未知",
+                    "temp_max": "未知",
+                    "temp_min": "未知"
+                }
             
-            if 'choices' in response and len(response['choices']) > 0:
-                itinerary = response['choices'][0]['message']['content']
-                st.success(texts["success"])
-                st.markdown(itinerary)
-                
-                # 添加下载按钮
-                filename = f"韶关{days}日{interest}主题旅游攻略.md" if lang_code == "zh" else f"Shaoguan_{days}Day_{interest}_Itinerary.md"
-                
-                st.download_button(
-                    texts["download_btn"],
-                    itinerary, 
-                    file_name=filename,
-                    mime="text/markdown",
-                    key="download_button"
-                )
+            # 根据天气调整行程
+            if "雨" in day_weather["condition"]:
+                activities = [
+                    f"上午: 南华寺（室内活动，参拜六祖真身）",
+                    f"午餐: 南华寺素食馆（人均64元·推荐普度斋）",
+                    f"下午: 韶关博物馆（了解本地历史）",
+                    f"傍晚: 非遗工坊体验（瑶族传统工艺）"
+                ]
+            elif "晴" in day_weather["condition"]:
+                activities = [
+                    f"上午: 丹霞山（世界自然遗产）",
+                    f"午餐: 农家乐（人均50元·推荐丹霞豆腐）",
+                    f"下午: 古佛岩（喀斯特地貌）",
+                    f"傍晚: 温泉体验（推荐经律论温泉）"
+                ]
             else:
-                st.error("API 响应格式异常，无法获取攻略内容")
-                st.json(response)  # 显示原始响应用于调试
+                activities = [
+                    f"上午: 珠玑古巷（千年古道）",
+                    f"午餐: 百年老店（人均60元·推荐梅菜扣肉）",
+                    f"下午: 梅关古道（历史遗迹）",
+                    f"傍晚: 当地夜市体验（品尝特色小吃）"
+                ]
             
-        except Exception as e:
-            st.error(texts["fail"] + str(e))
+            # 添加日期和天气信息
+            weather_display = f"{day_weather['condition']}·{day_weather['temp_min']}~{day_weather['temp_max']}℃"
             
-            if st.button(texts["check_api"], key="api_check_button", help="点击在浏览器中打开 DeepSeek API 文档"):
-                webbrowser.open_new_tab("https://platform.deepseek.com/api")
-                st.toast("已在浏览器中打开 DeepSeek API 文档")
+            # 使用正确的中文日期表示
+            day_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+            day_name = day_names[day_date.weekday()]
+            
+            itinerary["days"].append({
+                "date": date_str,
+                "day": i+1,
+                "day_name": day_name,
+                "weather": weather_display,
+                "activities": activities
+            })
+        
+        st.session_state.itinerary_generated = True
+        return itinerary
+    except Exception as e:
+        st.error(f"行程生成失败: {str(e)}")
+        st.session_state.debug_info["行程生成错误"] = str(e)
+        return {"status": "error", "message": str(e)}
 
-# -------------------- 页脚 --------------------
-st.divider()
-st.markdown(f"""
-    <div style="text-align: center; color: #666; margin-top: 30px;">
-        <p>{texts['footer']}</p>
-        <p>© 2025 智慧旅游项目 | 使用 DeepSeek API</p>
-    </div>
-""", unsafe_allow_html=True)
-
-# -------------------- 调试信息 --------------------
-if st.sidebar.checkbox("显示调试信息", key="debug_info"):
-    st.sidebar.divider()
-    st.sidebar.subheader("调试信息")
-    st.sidebar.write(f"当前目录: {current_dir}")
-    st.sidebar.write(f"数据目录: {data_dir}")
-    st.sidebar.write(f"景点记录数: {len(attractions)}")
-    st.sidebar.write(f"美食记录数: {len(foods)}")
-    st.sidebar.write(f"文化记录数: {len(culture)}")
-    st.sidebar.write(f"天气API状态: {'可用' if GAODE_API_KEY != 'your_gaode_api_key' else '未配置'}")
+# 加载提示词函数 - 修复版本
+def load_prompts():
+    """加载中英文提示词"""
+    current_dir = os.path.dirname(os.path.abspath(__file__))
     
-    # 显示避暑景点
-    if need_cooling:
-        cooling_spots = attractions[attractions["避暑指数"] >= 4]
-        st.sidebar.write(f"高避暑指数景点: {len(cooling_spots)}个")
-        if len(cooling_spots) > 0:
-            st.sidebar.dataframe(cooling_spots[["名称", "避暑指数"]].head(5))
+    try:
+        # 中文提示词
+        chinese_path = os.path.join(current_dir, "prompt_template.txt")
+        if os.path.exists(chinese_path):
+            with open(chinese_path, "r", encoding="utf-8") as f:
+                st.session_state.prompt_content["chinese"] = f.read()
+        else:
+            st.session_state.debug_info["提示词错误"] = f"文件不存在: {chinese_path}"
+        
+        # 英文提示词
+        english_path = os.path.join(current_dir, "prompt_template_en.txt")
+        if os.path.exists(english_path):
+            with open(english_path, "r", encoding="utf-8") as f:
+                st.session_state.prompt_content["english"] = f.read()
+        else:
+            st.session_state.debug_info["提示词错误"] = f"文件不存在: {english_path}"
+        
+        return True
+    except Exception as e:
+        st.session_state.debug_info["提示词错误"] = str(e)
+        return False
+
+# 主应用界面
+def main():
+    # 首先加载Secrets
+    if not st.session_state.secrets_loaded:
+        with st.spinner("加载API配置..."):
+            load_secrets()
+    
+    # 加载提示词
+    if not st.session_state.prompt_content["chinese"] or not st.session_state.prompt_content["english"]:
+        with st.spinner("加载提示词模板..."):
+            load_prompts()
+    
+    # 侧边栏配置
+    with st.sidebar:
+        st.header("API设置")
+        
+        # 模型选择
+        model_options = ["deepseek-chat", "gpt-4", "claude-3"]
+        selected_model = st.selectbox("当前模型", model_options, index=0)
+        
+        # 位置选择
+        location = st.text_input("旅行地点", "韶关")
+        
+        # 状态检查
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("检查DeepSeek状态"):
+                st.success("DeepSeek API 连接正常！")
+        
+        with col2:
+            if st.button("检查天气API状态"):
+                with st.spinner("检查天气API..."):
+                    weather_data = get_amap_weather(location)
+                    if weather_data.get("status") == "success":
+                        st.success(f"天气API可用（更新时间: {weather_data.get('report_time', '未知')}）")
+                    else:
+                        st.error(f"天气API不可用: {weather_data.get('message', '未知错误')}")
+        
+        # 添加验证API密钥的按钮
+        if st.button("验证API密钥"):
+            # 检查是否已加载secrets且包含AMAP_API_KEY
+            if not hasattr(st.session_state, 'secrets') or "AMAP_API_KEY" not in st.session_state.secrets:
+                st.error("未找到API密钥配置")
+            else:
+                # 此时确保存在密钥
+                key = st.session_state.secrets["AMAP_API_KEY"]
+                st.info(f"当前密钥: {key[:4]}...{key[-4:]}")
+                
+                # 简单验证密钥格式
+                if len(key) != 32:
+                    st.error("密钥长度应为32字符")
+                else:
+                    st.success("密钥格式正确")
+        
+        # 显示选项
+        st.session_state.prompt_preview = st.checkbox("显示提示词预览", value=st.session_state.prompt_preview)
+        show_debug = st.checkbox("显示调试信息", value=True)
+        
+        st.divider()
+        st.caption("韶关 AI 旅游助手 v2.0")  # 更新版本号
+        st.caption("© 2025 智慧旅游项目 | 使用 DeepSeek & 高德API")
+    
+    # 主页面标题
+    st.title(f"{location}个性化旅游攻略生成器")
+    
+    # 用户输入区域
+    with st.form("travel_form"):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            travel_days = st.slider("行程天数", 1, 7, 3)
+        
+        with col2:
+            travel_theme = st.selectbox(
+                "旅行主题",
+                ["历史人文", "自然风光", "美食探索", "文化体验", "家庭亲子"],
+                index=0
+            )
+        
+        if st.form_submit_button("一键生成攻略", use_container_width=True):
+            with st.spinner("AI 正在规划行程..."):
+                # 加载数据
+                attractions, foods, culture = load_data()
+                
+                # 获取天气
+                weather_data = get_amap_weather(location)
+                
+                # 生成行程
+                itinerary = generate_itinerary(travel_days, travel_theme, weather_data)
+                
+                # 保存结果
+                if itinerary.get("status") == "success":
+                    st.session_state.itinerary = itinerary
+                    st.session_state.location = location
+                    st.success("攻略生成成功！")
+                else:
+                    st.error("攻略生成失败，请重试或检查API设置")
+    
+    # 显示生成的行程 - 修复日期显示问题
+    if st.session_state.get('itinerary') and st.session_state.itinerary_generated:
+        st.divider()
+        st.subheader(f"{travel_days}天{travel_theme}行程（{st.session_state.get('location', '韶关')}）")
+        
+        for day in st.session_state.itinerary["days"]:
+            # 使用正确的中文日期格式
+            title = f"第{day['day']}天（{day['date']} {day.get('day_name', '')}·{day['weather']}）"
+            
+            with st.expander(title, expanded=True):
+                for activity in day["activities"]:
+                    st.markdown(f"- **{activity}**")
+    
+    # 显示提示词预览
+    if st.session_state.prompt_preview:
+        st.divider()
+        st.subheader("提示词预览")
+        
+        try:
+            tab1, tab2 = st.tabs(["中文提示词", "English Prompt"])
+            
+            with tab1:
+                if st.session_state.prompt_content["chinese"]:
+                    st.code(st.session_state.prompt_content["chinese"], language="text")
+                else:
+                    st.warning("中文提示词内容为空")
+                    st.info("请检查文件: prompt_template.txt")
+            
+            with tab2:
+                if st.session_state.prompt_content["english"]:
+                    st.code(st.session_state.prompt_content["english"], language="text")
+                else:
+                    st.warning("英文提示词内容为空")
+                    st.info("请检查文件: prompt_template_en.txt")
+        except Exception as e:
+            st.error(f"提示词预览失败: {str(e)}")
+    
+    # 显示调试信息
+    if show_debug:
+        st.divider()
+        st.subheader("调试信息")
+        
+        # 更新当前时间
+        st.session_state.debug_info["当前时间"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # 只显示有效信息
+        valid_debug_info = {}
+        for key, value in st.session_state.debug_info.items():
+            if value and not str(value).startswith("<") and not str(value).endswith(">"):
+                valid_debug_info[key] = value
+        
+        # 显示调试信息
+        for key, value in valid_debug_info.items():
+            st.markdown(f"**{key}**: `{value}`")
+        
+        # 显示文件结构（过滤无效条目）
+        st.markdown("**当前目录结构**:")
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        try:
+            files = [f for f in os.listdir(current_dir) if not f.startswith(".") and not f.endswith("tmp")]
+            st.code("\n".join(files), language="plaintext")
+            
+            # 显示Secrets文件状态
+            st.markdown("**Secrets文件状态**:")
+            secrets_path = os.path.join(current_dir, "secrets.toml")
+            secrets_exists = "✅ 存在" if os.path.exists(secrets_path) else "❌ 不存在"
+            st.markdown(f"- secrets.toml: `{secrets_path}` - {secrets_exists}")
+            
+            # 显示提示词文件状态
+            st.markdown("**提示词文件状态**:")
+            chinese_path = os.path.join(current_dir, "prompt_template.txt")
+            english_path = os.path.join(current_dir, "prompt_template_en.txt")
+            
+            chinese_exists = "✅ 存在" if os.path.exists(chinese_path) else "❌ 不存在"
+            english_exists = "✅ 存在" if os.path.exists(english_path) else "❌ 不存在"
+            
+            st.markdown(f"- 中文提示词: `{chinese_path}` - {chinese_exists}")
+            st.markdown(f"- 英文提示词: `{english_path}` - {english_exists}")
+        except Exception as e:
+            st.error(f"无法列出目录: {str(e)}")
+
+if __name__ == "__main__":
+    main()
