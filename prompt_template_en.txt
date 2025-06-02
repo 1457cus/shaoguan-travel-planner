@@ -1,4 +1,4 @@
-﻿As a Shaoguan tourism expert, plan a {days}-day itinerary based on:
+As a Shaoguan tourism expert, plan a {days}-day itinerary based on:
 • Budget: ¥{budget} (including tickets, meals, accommodation)
 • Theme: {interest}
 • Recommended attractions: {attractions}
